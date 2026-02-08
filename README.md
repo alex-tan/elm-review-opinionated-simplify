@@ -23,6 +23,98 @@ config =
     ]
 ```
 
+## Examples
+
+### PreferMaybeChaining
+
+#### Maybe.map
+
+```elm
+-- Before
+case maybeValue of
+    Nothing -> Nothing
+    Just x -> Just (f x)
+
+-- After
+maybeValue
+    |> Maybe.map (\x -> f x)
+```
+
+#### Maybe.andThen
+
+```elm
+-- Before
+case maybeId of
+    Nothing -> Nothing
+    Just id -> Store.findById id store
+
+-- After
+maybeId
+    |> Maybe.andThen (\id -> Store.findById id store)
+```
+
+Pipe chains are flattened:
+
+```elm
+-- Before
+case maybeId of
+    Nothing -> Nothing
+    Just id -> lookup id |> Maybe.map .name
+
+-- After
+maybeId
+    |> Maybe.andThen (\id -> lookup id)
+    |> Maybe.map .name
+```
+
+#### Maybe.withDefault
+
+```elm
+-- Before
+case maybeValue of
+    Nothing -> 0
+    Just x -> x
+
+-- After
+maybeValue
+    |> Maybe.withDefault 0
+```
+
+#### Maybe.Extra.withDefaultLazy
+
+Used when the default expression is not a simple literal or variable:
+
+```elm
+-- Before
+case maybeValue of
+    Nothing -> computeDefault model
+    Just x -> x
+
+-- After
+maybeValue
+    |> Maybe.Extra.withDefaultLazy (\() -> computeDefault model)
+```
+
+### SimplifyLambdaToComposition
+
+```elm
+-- Before
+List.sortBy (\todo -> Time.posixToMillis todo.createdAt) todos
+
+-- After
+List.sortBy (Time.posixToMillis << .createdAt) todos
+```
+
+Nested function applications are also handled:
+
+```elm
+-- Before
+List.map (\x -> f (g x.field)) list
+
+-- After
+List.map (f << g << .field) list
+```
+
 ## Try it out
 
 You can try the example configuration above out by running the following command:
