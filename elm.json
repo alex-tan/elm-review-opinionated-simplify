@@ -1,7 +1,7 @@
 {
     "type": "package",
     "name": "alex-tan/elm-review-opinionated-simplify",
-    "summary": "",
+    "summary": "Opinionated elm-review simplification rules.",
     "license": "MIT",
     "version": "1.0.0",
     "exposed-modules": [
