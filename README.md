@@ -2,6 +2,8 @@
 
 Provides [`elm-review`](https://package.elm-lang.org/packages/jfmengels/elm-review/latest/) rules for opinionated simplification of Elm code.
 
+> This package was generated with [Claude Code](https://claude.ai/code). There may be bugs -- pull requests are welcome.
+
 ## Provided rules
 
 - [`PreferMaybeChaining`](https://package.elm-lang.org/packages/alex-tan/elm-review-opinionated-simplify/1.0.0/PreferMaybeChaining) - Reports case expressions on Maybe that can be simplified using `Maybe.map`, `Maybe.andThen`, `Maybe.withDefault`, or `Maybe.Extra.withDefaultLazy`.
@@ -26,6 +28,8 @@ config =
 ## Examples
 
 ### PreferMaybeChaining
+
+**Note:** This rule suggests using [`Maybe.Extra.withDefaultLazy`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) for complex default expressions. Make sure [`elm-community/maybe-extra`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) is installed in your project.
 
 #### Maybe.map
 
