@@ -296,12 +296,13 @@ a =
 a =
     maybeId
         |> Maybe.andThen (\\id -> lookup id)
-        |> Maybe.map ((\\item ->
-            let
-                detail = item.name
-            in
-            detail
-        ))
+        |> Maybe.map
+                    (\\item ->
+                        let
+                            detail = item.name
+                        in
+                        detail
+                    )
 """
                         ]
         ]
@@ -458,6 +459,7 @@ a =
                             , under = "case maybeValue of\n        Nothing -> computeDefault model\n        Just x -> x"
                             }
                             |> Review.Test.whenFixed """module A exposing (..)
+import Maybe.Extra
 a =
     maybeValue
         |> Maybe.Extra.withDefaultLazy (\\() -> computeDefault model)
@@ -479,6 +481,7 @@ a =
                             , under = "case maybeValue of\n        Nothing -> model.defaultName\n        Just x -> x"
                             }
                             |> Review.Test.whenFixed """module A exposing (..)
+import Maybe.Extra
 a =
     maybeValue
         |> Maybe.Extra.withDefaultLazy (\\() -> model.defaultName)
@@ -500,6 +503,7 @@ a =
                             , under = "case maybeValue of\n        Nothing -> if flag then x else y\n        Just v -> v"
                             }
                             |> Review.Test.whenFixed """module A exposing (..)
+import Maybe.Extra
 a =
     maybeValue
         |> Maybe.Extra.withDefaultLazy (\\() -> if flag then x else y)
@@ -521,6 +525,7 @@ a =
                             , under = "case maybeValue of\n        Nothing -> Maybe.withDefault (Maybe.withDefault empty autoValue) savedValue\n        Just v -> v"
                             }
                             |> Review.Test.whenFixed """module A exposing (..)
+import Maybe.Extra
 a =
     maybeValue
         |> Maybe.Extra.withDefaultLazy (\\() -> Maybe.withDefault (Maybe.withDefault empty autoValue) savedValue)
@@ -822,7 +827,7 @@ a =
                                 |> Review.Test.whenFixed """module A exposing (..)
 a =
     "prefix: " ++ (maybeValue
-                       |> Maybe.withDefault "")
+                      |> Maybe.withDefault "")
 """
                             ]
             , test "subject using <|" <|
