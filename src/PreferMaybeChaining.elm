@@ -6,6 +6,7 @@ module PreferMaybeChaining exposing (rule)
 
 -}
 
+import Dict exposing (Dict)
 import Elm.Syntax.Declaration as Declaration exposing (Declaration)
 import Elm.Syntax.Expression as Expression exposing (Expression(..))
 import Elm.Syntax.Import exposing (Import)
@@ -15,6 +16,7 @@ import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern)
 import Elm.Syntax.Range exposing (Location, Range)
 import Review.Fix as Fix exposing (Fix)
+import Review.Project.Dependency exposing (Dependency)
 import Review.Rule as Rule exposing (Rule)
 
 
@@ -59,9 +61,12 @@ import Review.Rule as Rule exposing (Rule)
 
     Maybe.Extra.withDefaultLazy (\() -> complexExpr) maybeValue
 
-A case expression whose `Just` branch makes a tail call to the function it is in
-is not reported, since moving that call into a lambda would lose tail-call
+A case expression whose `Just` or `Nothing` branch makes a tail call to the function
+it is in is not reported, since moving that call into a lambda would lose tail-call
 optimisation.
+
+The `Maybe.Extra.withDefaultLazy` fix is only offered when `elm-community/maybe-extra` is a
+direct dependency of the project.
 
 
 ## Try it out
@@ -75,17 +80,34 @@ elm-review --template alex-tan/elm-review-opinionated-simplify/example --rules P
 -}
 rule : Rule
 rule =
-    Rule.newModuleRuleSchemaUsingContextCreator "PreferMaybeChaining" initialContext
+    Rule.newProjectRuleSchema "PreferMaybeChaining" { hasMaybeExtra = False }
+        |> Rule.withDirectDependenciesProjectVisitor dependenciesVisitor
+        |> Rule.withModuleVisitor moduleVisitor
+        |> Rule.withModuleContextUsingContextCreator
+            { fromProjectToModule = initialContext
+            , fromModuleToProject = Rule.initContextCreator (\context -> { hasMaybeExtra = context.hasMaybeExtra })
+            , foldProjectContexts = \new _ -> new
+            }
+        |> Rule.fromProjectRuleSchema
+
+
+moduleVisitor : Rule.ModuleRuleSchema {} Context -> Rule.ModuleRuleSchema { hasAtLeastOneVisitor : () } Context
+moduleVisitor schema =
+    schema
         |> Rule.withModuleDefinitionVisitor moduleDefinitionVisitor
         |> Rule.withCommentsVisitor commentsVisitor
         |> Rule.withImportVisitor importVisitor
         |> Rule.withDeclarationEnterVisitor declarationVisitor
         |> Rule.withExpressionEnterVisitor expressionVisitor
-        |> Rule.fromModuleRuleSchema
 
 
 
 -- CONTEXT
+
+
+type alias ProjectContext =
+    { hasMaybeExtra : Bool
+    }
 
 
 type alias Context =
@@ -94,6 +116,9 @@ type alias Context =
 
     -- How `Maybe.Extra` is referred to in this module, if it is imported
     , maybeExtraQualifier : Maybe String
+
+    -- Whether elm-community/maybe-extra is a direct dependency
+    , hasMaybeExtra : Bool
 
     -- Where to add `import Maybe.Extra` when it isn't imported
     , importLocation : Location
@@ -106,13 +131,14 @@ type alias Context =
     }
 
 
-initialContext : Rule.ContextCreator () Context
+initialContext : Rule.ContextCreator ProjectContext Context
 initialContext =
     Rule.initContextCreator
-        (\extractSourceCode () ->
+        (\extractSourceCode projectContext ->
             { extractSourceCode = extractSourceCode
             , comments = []
             , maybeExtraQualifier = Nothing
+            , hasMaybeExtra = projectContext.hasMaybeExtra
             , importLocation = { row = 1, column = 1 }
             , operatorOperands = []
             , enclosingFunctions = []
@@ -145,6 +171,11 @@ commentsVisitor comments context =
         , importLocation = importLocation
       }
     )
+
+
+dependenciesVisitor : Dict String Dependency -> ProjectContext -> ( List (Rule.Error { useErrorForModule : () }), ProjectContext )
+dependenciesVisitor dependencies _ =
+    ( [], { hasMaybeExtra = Dict.member "elm-community/maybe-extra" dependencies } )
 
 
 importVisitor : Node Import -> Context -> ( List (Rule.Error {}), Context )
@@ -235,7 +266,7 @@ checkCaseExpression context range caseBlock =
         [ first, second ] ->
             case extractMaybeCase caseBlock.expression first second of
                 Just maybeCase ->
-                    if makesTailCall (enclosingFunctionNames context range) maybeCase.justExpr then
+                    if makesTailCall (enclosingFunctionNames context range) maybeCase.justExpr || makesTailCall (enclosingFunctionNames context range) maybeCase.nothingExpr then
                         []
 
                     else
@@ -498,49 +529,67 @@ createError context range maybeCase =
                 []
 
     else if isBoundVariable maybeCase.justPattern maybeCase.justExpr then
-        let
-            default : Node Expression
-            default =
-                unwrapParens maybeCase.nothingExpr
-
-            defaultSource : String
-            defaultSource =
-                context.extractSourceCode (Node.range default)
-        in
-        if isSimpleDefault (Node.value default) then
-            [ report context
-                range
-                { message = "Use Maybe.withDefault instead of case expression"
-                , details = [ "This case expression can be simplified using Maybe.withDefault." ]
-                }
-                { subject = maybeCase.subject
-                , kept = [ Node.range default ]
-                , steps = [ "Maybe.withDefault " ++ defaultSource ]
-                , extraFixes = []
-                }
-            ]
-
-        else
-            [ report context
-                range
-                { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
-                , details = [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy." ]
-                }
-                { subject = maybeCase.subject
-                , kept = [ Node.range default ]
-                , steps = [ Maybe.withDefault "Maybe.Extra" context.maybeExtraQualifier ++ ".withDefaultLazy (\\() -> " ++ defaultSource ++ ")" ]
-                , extraFixes =
-                    case context.maybeExtraQualifier of
-                        Just _ ->
-                            []
-
-                        Nothing ->
-                            [ Fix.insertAt context.importLocation "\nimport Maybe.Extra" ]
-                }
-            ]
+        withDefaultErrors context range maybeCase
 
     else
         []
+
+
+{-| `Nothing -> default; Just x -> x`
+-}
+withDefaultErrors : Context -> Range -> MaybeCase -> List (Rule.Error {})
+withDefaultErrors context range maybeCase =
+    let
+        default : Node Expression
+        default =
+            unwrapParens maybeCase.nothingExpr
+
+        defaultSource : String
+        defaultSource =
+            context.extractSourceCode (Node.range default)
+    in
+    if isSimpleDefault (Node.value default) then
+        [ report context
+            range
+            { message = "Use Maybe.withDefault instead of case expression"
+            , details = [ "This case expression can be simplified using Maybe.withDefault." ]
+            }
+            { subject = maybeCase.subject
+            , kept = [ Node.range default ]
+            , steps = [ "Maybe.withDefault " ++ defaultSource ]
+            , extraFixes = []
+            }
+        ]
+
+    else if not context.hasMaybeExtra then
+        [ Rule.error
+            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
+            , details =
+                [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy."
+                , "Add elm-community/maybe-extra to the project's dependencies to get an automatic fix."
+                ]
+            }
+            range
+        ]
+
+    else
+        [ report context
+            range
+            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
+            , details = [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy." ]
+            }
+            { subject = maybeCase.subject
+            , kept = [ Node.range default ]
+            , steps = [ Maybe.withDefault "Maybe.Extra" context.maybeExtraQualifier ++ ".withDefaultLazy (\\() -> " ++ defaultSource ++ ")" ]
+            , extraFixes =
+                case context.maybeExtraQualifier of
+                    Just _ ->
+                        []
+
+                    Nothing ->
+                        [ Fix.insertAt context.importLocation "\nimport Maybe.Extra" ]
+            }
+        ]
 
 
 type alias Rewrite =
@@ -653,6 +702,20 @@ isSimpleDefault expr =
 
         Hex _ ->
             True
+
+        Negation inner ->
+            case Node.value inner of
+                Integer _ ->
+                    True
+
+                Hex _ ->
+                    True
+
+                Floatable _ ->
+                    True
+
+                _ ->
+                    False
 
         Floatable _ ->
             True
