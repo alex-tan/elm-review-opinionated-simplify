@@ -6,11 +6,17 @@ module PreferMaybeChaining exposing (rule)
 
 -}
 
+import Dict exposing (Dict)
+import Elm.Syntax.Declaration as Declaration exposing (Declaration)
 import Elm.Syntax.Expression as Expression exposing (Expression(..))
+import Elm.Syntax.Import exposing (Import)
+import Elm.Syntax.Module exposing (Module)
+import Elm.Syntax.ModuleName exposing (ModuleName)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern)
-import Elm.Syntax.Range exposing (Range)
-import Review.Fix as Fix
+import Elm.Syntax.Range exposing (Location, Range)
+import Review.Fix as Fix exposing (Fix)
+import Review.Project.Dependency exposing (Dependency)
 import Review.Rule as Rule exposing (Rule)
 
 
@@ -55,6 +61,13 @@ import Review.Rule as Rule exposing (Rule)
 
     Maybe.Extra.withDefaultLazy (\() -> complexExpr) maybeValue
 
+A case expression whose `Just` or `Nothing` branch makes a tail call to the function
+it is in is not reported, since moving that call into a lambda would lose tail-call
+optimisation.
+
+The `Maybe.Extra.withDefaultLazy` fix is only offered when `elm-community/maybe-extra` is a
+direct dependency of the project.
+
 
 ## Try it out
 
@@ -67,28 +80,197 @@ elm-review --template alex-tan/elm-review-opinionated-simplify/example --rules P
 -}
 rule : Rule
 rule =
-    Rule.newModuleRuleSchema "PreferMaybeChaining" ()
-        |> Rule.withSimpleExpressionVisitor expressionVisitor
-        |> Rule.fromModuleRuleSchema
+    Rule.newProjectRuleSchema "PreferMaybeChaining" { hasMaybeExtra = False }
+        |> Rule.withDirectDependenciesProjectVisitor dependenciesVisitor
+        |> Rule.withModuleVisitor moduleVisitor
+        |> Rule.withModuleContextUsingContextCreator
+            { fromProjectToModule = initialContext
+            , fromModuleToProject = Rule.initContextCreator (\context -> { hasMaybeExtra = context.hasMaybeExtra })
+            , foldProjectContexts = \new _ -> new
+            }
+        |> Rule.fromProjectRuleSchema
 
 
-expressionVisitor : Node Expression -> List (Rule.Error {})
-expressionVisitor node =
+moduleVisitor : Rule.ModuleRuleSchema {} Context -> Rule.ModuleRuleSchema { hasAtLeastOneVisitor : () } Context
+moduleVisitor schema =
+    schema
+        |> Rule.withModuleDefinitionVisitor moduleDefinitionVisitor
+        |> Rule.withCommentsVisitor commentsVisitor
+        |> Rule.withImportVisitor importVisitor
+        |> Rule.withDeclarationEnterVisitor declarationVisitor
+        |> Rule.withExpressionEnterVisitor expressionVisitor
+
+
+
+-- CONTEXT
+
+
+type alias ProjectContext =
+    { hasMaybeExtra : Bool
+    }
+
+
+type alias Context =
+    { extractSourceCode : Range -> String
+    , comments : List Range
+
+    -- How `Maybe.Extra` is referred to in this module, if it is imported
+    , maybeExtraQualifier : Maybe String
+
+    -- Whether elm-community/maybe-extra is a direct dependency
+    , hasMaybeExtra : Bool
+
+    -- Where to add `import Maybe.Extra` when it isn't imported
+    , importLocation : Location
+
+    -- Right operands of operators: a pipeline there needs parentheses
+    , operatorOperands : List Range
+
+    -- The functions (top-level and let) we might be inside, with their ranges
+    , enclosingFunctions : List ( Range, String )
+    }
+
+
+initialContext : Rule.ContextCreator ProjectContext Context
+initialContext =
+    Rule.initContextCreator
+        (\extractSourceCode projectContext ->
+            { extractSourceCode = extractSourceCode
+            , comments = []
+            , maybeExtraQualifier = Nothing
+            , hasMaybeExtra = projectContext.hasMaybeExtra
+            , importLocation = { row = 1, column = 1 }
+            , operatorOperands = []
+            , enclosingFunctions = []
+            }
+        )
+        |> Rule.withSourceCodeExtractor
+
+
+moduleDefinitionVisitor : Node Module -> Context -> ( List (Rule.Error {}), Context )
+moduleDefinitionVisitor node context =
+    ( [], { context | importLocation = (Node.range node).end } )
+
+
+commentsVisitor : List (Node String) -> Context -> ( List (Rule.Error {}), Context )
+commentsVisitor comments context =
+    let
+        -- Imports go after the module documentation, the first `{-|` comment
+        -- (declarations' documentation isn't part of the comments)
+        importLocation : Location
+        importLocation =
+            comments
+                |> List.filter (Node.value >> String.startsWith "{-|")
+                |> List.head
+                |> Maybe.map (Node.range >> .end)
+                |> Maybe.withDefault context.importLocation
+    in
+    ( []
+    , { context
+        | comments = List.map Node.range comments
+        , importLocation = importLocation
+      }
+    )
+
+
+dependenciesVisitor : Dict String Dependency -> ProjectContext -> ( List (Rule.Error { useErrorForModule : () }), ProjectContext )
+dependenciesVisitor dependencies _ =
+    ( [], { hasMaybeExtra = Dict.member "elm-community/maybe-extra" dependencies } )
+
+
+importVisitor : Node Import -> Context -> ( List (Rule.Error {}), Context )
+importVisitor node context =
+    let
+        import_ : Import
+        import_ =
+            Node.value node
+
+        maybeExtraQualifier : Maybe String
+        maybeExtraQualifier =
+            if Node.value import_.moduleName == [ "Maybe", "Extra" ] then
+                import_.moduleAlias
+                    |> Maybe.map (Node.value >> String.join ".")
+                    |> Maybe.withDefault "Maybe.Extra"
+                    |> Just
+
+            else
+                context.maybeExtraQualifier
+    in
+    ( []
+    , { context
+        | importLocation = (Node.range node).end
+        , maybeExtraQualifier = maybeExtraQualifier
+      }
+    )
+
+
+declarationVisitor : Node Declaration -> Context -> ( List (Rule.Error {}), Context )
+declarationVisitor node context =
     case Node.value node of
-        CaseExpression caseExpr ->
-            checkCaseExpression (Node.range node) caseExpr
+        Declaration.FunctionDeclaration function ->
+            ( []
+            , { context
+                | enclosingFunctions = [ ( Node.range node, Node.value (Node.value function.declaration).name ) ]
+              }
+            )
 
         _ ->
-            []
+            ( [], { context | enclosingFunctions = [] } )
 
 
-checkCaseExpression : Range -> Expression.CaseBlock -> List (Rule.Error {})
-checkCaseExpression range caseBlock =
+expressionVisitor : Node Expression -> Context -> ( List (Rule.Error {}), Context )
+expressionVisitor node context =
+    case Node.value node of
+        OperatorApplication _ _ _ right ->
+            ( [], { context | operatorOperands = Node.range right :: context.operatorOperands } )
+
+        LetExpression letBlock ->
+            ( []
+            , { context
+                | enclosingFunctions = List.filterMap letFunction letBlock.declarations ++ context.enclosingFunctions
+              }
+            )
+
+        CaseExpression caseBlock ->
+            ( checkCaseExpression context (Node.range node) caseBlock, context )
+
+        _ ->
+            ( [], context )
+
+
+letFunction : Node Expression.LetDeclaration -> Maybe ( Range, String )
+letFunction node =
+    case Node.value node of
+        Expression.LetFunction function ->
+            Just ( Node.range node, Node.value (Node.value function.declaration).name )
+
+        Expression.LetDestructuring _ _ ->
+            Nothing
+
+
+
+-- MATCHING
+
+
+type alias MaybeCase =
+    { subject : Node Expression
+    , justPattern : Node Pattern
+    , justExpr : Node Expression
+    , nothingExpr : Node Expression
+    }
+
+
+checkCaseExpression : Context -> Range -> Expression.CaseBlock -> List (Rule.Error {})
+checkCaseExpression context range caseBlock =
     case caseBlock.cases of
         [ first, second ] ->
-            case extractMaybePattern caseBlock.expression first second of
-                Just info ->
-                    createError range info
+            case extractMaybeCase caseBlock.expression first second of
+                Just maybeCase ->
+                    if makesTailCall (enclosingFunctionNames context range) maybeCase.justExpr || makesTailCall (enclosingFunctionNames context range) maybeCase.nothingExpr then
+                        []
+
+                    else
+                        createError context range maybeCase
 
                 Nothing ->
                     []
@@ -97,79 +279,37 @@ checkCaseExpression range caseBlock =
             []
 
 
-type MaybePatternInfo
-    = NothingToNothing
-        { boundPattern : String
-        , justExpr : Expression
-        , caseSubject : String
-        }
-    | NothingToDefault
-        { boundPattern : String
-        , defaultExpr : Expression
-        , caseSubject : String
-        }
-
-
-{-| Try to extract a Maybe case pattern
+{-| Names of the functions whose body contains the range.
 -}
-extractMaybePattern : Node Expression -> Expression.Case -> Expression.Case -> Maybe MaybePatternInfo
-extractMaybePattern subject first second =
+enclosingFunctionNames : Context -> Range -> List String
+enclosingFunctionNames context range =
+    context.enclosingFunctions
+        |> List.filter (\( functionRange, _ ) -> isWithin functionRange range)
+        |> List.map Tuple.second
+
+
+extractMaybeCase : Node Expression -> Expression.Case -> Expression.Case -> Maybe MaybeCase
+extractMaybeCase subject first second =
     -- Try both orderings: Nothing first or Just first
     case tryExtract subject first second of
-        Just info ->
-            Just info
+        Just maybeCase ->
+            Just maybeCase
 
         Nothing ->
             tryExtract subject second first
 
 
-tryExtract : Node Expression -> Expression.Case -> Expression.Case -> Maybe MaybePatternInfo
-tryExtract subject nothingCase justCase =
-    -- Check if first is Nothing -> something
-    case ( Node.value (Tuple.first nothingCase), Node.value (Tuple.second nothingCase) ) of
-        ( Pattern.NamedPattern { name } [], nothingExpr ) ->
-            if name == "Nothing" then
-                -- Check if second is Just pattern -> expr
-                case Node.value (Tuple.first justCase) of
-                    Pattern.NamedPattern justPattern [ boundPatternNode ] ->
-                        if justPattern.name == "Just" then
-                            case patternToString (Node.value boundPatternNode) of
-                                Just patternStr ->
-                                    let
-                                        justExpr =
-                                            Node.value (Tuple.second justCase)
-                                    in
-                                    if isNothingExpression nothingExpr then
-                                        -- Nothing -> Nothing pattern
-                                        Just
-                                            (NothingToNothing
-                                                { boundPattern = patternStr
-                                                , justExpr = justExpr
-                                                , caseSubject = nodeToString subject
-                                                }
-                                            )
-
-                                    else if isJustBoundVariable patternStr justExpr then
-                                        -- Just x -> x pattern (withDefault)
-                                        Just
-                                            (NothingToDefault
-                                                { boundPattern = patternStr
-                                                , defaultExpr = nothingExpr
-                                                , caseSubject = nodeToString subject
-                                                }
-                                            )
-
-                                    else
-                                        Nothing
-
-                                Nothing ->
-                                    Nothing
-
-                        else
-                            Nothing
-
-                    _ ->
-                        Nothing
+tryExtract : Node Expression -> Expression.Case -> Expression.Case -> Maybe MaybeCase
+tryExtract subject ( nothingPattern, nothingExpr ) ( justPattern, justExpr ) =
+    case ( Node.value nothingPattern, Node.value justPattern ) of
+        ( Pattern.NamedPattern nothing [], Pattern.NamedPattern just [ boundPattern ] ) ->
+            if nothing.name == "Nothing" && isMaybeModule nothing.moduleName && just.name == "Just" && isMaybeModule just.moduleName then
+                Just
+                    { subject = subject
+                    , justPattern = boundPattern
+                    , justExpr = justExpr
+                    , nothingExpr = nothingExpr
+                    }
 
             else
                 Nothing
@@ -178,685 +318,540 @@ tryExtract subject nothingCase justCase =
             Nothing
 
 
+isMaybeModule : ModuleName -> Bool
+isMaybeModule moduleName =
+    List.isEmpty moduleName || moduleName == [ "Maybe" ]
+
+
+isNothingExpression : Node Expression -> Bool
+isNothingExpression node =
+    case Node.value node of
+        FunctionOrValue moduleName "Nothing" ->
+            isMaybeModule moduleName
+
+        _ ->
+            False
+
+
 {-| Check if the Just branch just returns the bound variable
 -}
-isJustBoundVariable : String -> Expression -> Bool
-isJustBoundVariable boundVar expr =
-    case expr of
-        FunctionOrValue [] name ->
-            name == boundVar
-
-        ParenthesizedExpression innerNode ->
-            isJustBoundVariable boundVar (Node.value innerNode)
+isBoundVariable : Node Pattern -> Node Expression -> Bool
+isBoundVariable pattern expr =
+    case ( Node.value pattern, Node.value (unwrapParens expr) ) of
+        ( Pattern.VarPattern boundName, FunctionOrValue [] name ) ->
+            name == boundName
 
         _ ->
             False
 
 
-{-| Convert a pattern to its string representation
--}
-patternToString : Pattern -> Maybe String
-patternToString pattern =
-    case pattern of
-        Pattern.VarPattern name ->
-            Just name
-
-        Pattern.TuplePattern nodes ->
-            let
-                parts =
-                    List.map (Node.value >> patternToString) nodes
-            in
-            if List.all ((/=) Nothing) parts then
-                Just ("( " ++ String.join ", " (List.filterMap identity parts) ++ " )")
-
-            else
-                Nothing
-
-        Pattern.RecordPattern fields ->
-            Just ("{ " ++ String.join ", " (List.map Node.value fields) ++ " }")
-
-        Pattern.AllPattern ->
-            Just "_"
-
-        Pattern.NamedPattern { moduleName, name } args ->
-            let
-                argStrings =
-                    List.map (Node.value >> patternToString) args
-            in
-            if List.all ((/=) Nothing) argStrings then
-                let
-                    qualifiedName =
-                        if List.isEmpty moduleName then
-                            name
-
-                        else
-                            String.join "." moduleName ++ "." ++ name
-                in
-                if List.isEmpty args then
-                    Just qualifiedName
-
-                else
-                    Just (qualifiedName ++ " " ++ String.join " " (List.filterMap identity argStrings))
-
-            else
-                Nothing
-
-        Pattern.ParenthesizedPattern innerNode ->
-            patternToString (Node.value innerNode)
-                |> Maybe.map (\s -> "(" ++ s ++ ")")
-
-        Pattern.AsPattern innerNode (Node _ alias) ->
-            patternToString (Node.value innerNode)
-                |> Maybe.map (\s -> s ++ " as " ++ alias)
-
-        Pattern.UnConsPattern headNode tailNode ->
-            Maybe.map2
-                (\h t -> h ++ " :: " ++ t)
-                (patternToString (Node.value headNode))
-                (patternToString (Node.value tailNode))
-
-        Pattern.ListPattern nodes ->
-            let
-                parts =
-                    List.map (Node.value >> patternToString) nodes
-            in
-            if List.all ((/=) Nothing) parts then
-                Just ("[" ++ String.join ", " (List.filterMap identity parts) ++ "]")
-
-            else
-                Nothing
-
-        Pattern.IntPattern n ->
-            Just (String.fromInt n)
-
-        Pattern.StringPattern s ->
-            Just ("\"" ++ s ++ "\"")
-
-        Pattern.CharPattern c ->
-            Just ("'" ++ String.fromChar c ++ "'")
-
-        Pattern.FloatPattern f ->
-            Just (String.fromFloat f)
-
-        Pattern.HexPattern n ->
-            Just (String.fromInt n)
-
-        Pattern.UnitPattern ->
-            Just "()"
-
-
-isNothingExpression : Expression -> Bool
-isNothingExpression expr =
-    case expr of
-        FunctionOrValue _ name ->
-            name == "Nothing"
-
-        _ ->
-            False
-
-
-createError : Range -> MaybePatternInfo -> List (Rule.Error {})
-createError range patternInfo =
-    let
-        -- Use the starting column of the case expression for indentation
-        indent =
-            String.repeat (range.start.column - 1) " "
-
-        -- Pipe is indented one level further
-        pipeIndent =
-            indent ++ "    "
-    in
-    case patternInfo of
-        NothingToNothing info ->
-            case classifyJustBranch info.justExpr of
-                MaybeMapCase innerExpr ->
-                    let
-                        -- Lambda body indentation (one more level)
-                        lambdaBodyIndent =
-                            pipeIndent ++ "    "
-
-                        innerExprStr =
-                            expressionToStringWithIndent lambdaBodyIndent innerExpr
-
-                        replacement =
-                            info.caseSubject ++ "\n" ++ pipeIndent ++ "|> Maybe.map (\\" ++ info.boundPattern ++ " -> " ++ innerExprStr ++ ")"
-                    in
-                    if String.contains "<expr>" replacement then
-                        -- Can't fully serialize the expression, report error without fix
-                        [ Rule.error
-                            { message = "Use Maybe.map instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.map with a pipe." ]
-                            }
-                            range
-                        ]
-
-                    else
-                        [ Rule.errorWithFix
-                            { message = "Use Maybe.map instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.map with a pipe." ]
-                            }
-                            range
-                            [ Fix.replaceRangeBy range replacement ]
-                        ]
-
-                MaybeAndThenCase innerExpr segments ->
-                    let
-                        -- Format the first expression (goes in the lambda body)
-                        firstExprStr =
-                            expressionToString innerExpr
-
-                        -- Format the additional segments as flattened pipes
-                        -- Each segment's argument needs to know its base indentation
-                        segmentsStr =
-                            segments
-                                |> List.map
-                                    (\seg ->
-                                        if seg.operator == "COMPLEX" then
-                                            -- Can't flatten, keep as single expression
-                                            "\n" ++ pipeIndent ++ "|> " ++ expressionToStringWithIndent pipeIndent seg.argument
-
-                                        else
-                                            "\n" ++ pipeIndent ++ "|> " ++ seg.operator ++ " " ++ expressionToStringAsArgWithBaseIndent pipeIndent seg.argument
-                                    )
-                                |> String.concat
-
-                        replacement =
-                            info.caseSubject ++ "\n" ++ pipeIndent ++ "|> Maybe.andThen (\\" ++ info.boundPattern ++ " -> " ++ firstExprStr ++ ")" ++ segmentsStr
-                    in
-                    if String.contains "<expr>" replacement || String.contains "COMPLEX" replacement then
-                        -- Can't fully serialize the expression, report error without fix
-                        [ Rule.error
-                            { message = "Use Maybe.andThen instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.andThen with a pipe." ]
-                            }
-                            range
-                        ]
-
-                    else
-                        [ Rule.errorWithFix
-                            { message = "Use Maybe.andThen instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.andThen with a pipe." ]
-                            }
-                            range
-                            [ Fix.replaceRangeBy range replacement ]
-                        ]
-
-                NotApplicable ->
-                    []
-
-        NothingToDefault info ->
-            case classifyDefaultExpr info.defaultExpr of
-                SimpleDefault defaultStr ->
-                    let
-                        replacement =
-                            info.caseSubject ++ "\n" ++ pipeIndent ++ "|> Maybe.withDefault " ++ defaultStr
-                    in
-                    [ Rule.errorWithFix
-                        { message = "Use Maybe.withDefault instead of case expression"
-                        , details = [ "This case expression can be simplified using Maybe.withDefault." ]
-                        }
-                        range
-                        [ Fix.replaceRangeBy range replacement ]
-                    ]
-
-                ComplexDefault defaultStr ->
-                    let
-                        replacement =
-                            info.caseSubject ++ "\n" ++ pipeIndent ++ "|> Maybe.Extra.withDefaultLazy (\\() -> " ++ defaultStr ++ ")"
-                    in
-                    if String.contains "<expr>" replacement then
-                        [ Rule.error
-                            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy." ]
-                            }
-                            range
-                        ]
-
-                    else
-                        [ Rule.errorWithFix
-                            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
-                            , details = [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy." ]
-                            }
-                            range
-                            [ Fix.replaceRangeBy range replacement ]
-                        ]
-
-
-type DefaultExprType
-    = SimpleDefault String
-    | ComplexDefault String
-
-
-{-| Classify whether the default expression is simple (variable/literal) or complex
--}
-classifyDefaultExpr : Expression -> DefaultExprType
-classifyDefaultExpr expr =
-    case expr of
-        -- Simple local variable
-        FunctionOrValue [] name ->
-            SimpleDefault name
-
-        -- Qualified variable (e.g., Module.value)
-        FunctionOrValue moduleName name ->
-            SimpleDefault (String.join "." moduleName ++ "." ++ name)
-
-        -- Literals
-        Integer n ->
-            SimpleDefault (String.fromInt n)
-
-        Floatable n ->
-            SimpleDefault (String.fromFloat n)
-
-        Literal s ->
-            SimpleDefault ("\"" ++ s ++ "\"")
-
-        CharLiteral c ->
-            SimpleDefault ("'" ++ String.fromChar c ++ "'")
-
-        -- Empty list
-        ListExpr [] ->
-            SimpleDefault "[]"
-
-        -- Unit
-        UnitExpr ->
-            SimpleDefault "()"
-
-        -- Parenthesized simple expression
-        ParenthesizedExpression innerNode ->
-            case classifyDefaultExpr (Node.value innerNode) of
-                SimpleDefault str ->
-                    SimpleDefault str
-
-                ComplexDefault str ->
-                    ComplexDefault str
-
-        -- Everything else is complex
-        _ ->
-            ComplexDefault (expressionToString expr)
-
-
-type JustBranchType
-    = MaybeMapCase Expression
-    | MaybeAndThenCase Expression (List PipeSegment)
+type JustBranch
+    = MapTo (Node Expression)
+    | AndThenTo (Node Expression) (List (Node Expression))
     | NotApplicable
 
 
-{-| A segment of a pipe chain, like `|> Maybe.andThen f` or `|> Maybe.map g`
--}
-type alias PipeSegment =
-    { operator : String -- e.g., "Maybe.andThen", "Maybe.map"
-    , argument : Expression -- the function argument
-    }
-
-
-{-| Extract pipe segments from a pipe expression.
-Returns (firstExpr, segments) where firstExpr is the leftmost expression
-and segments are the pipe operations.
--}
-extractPipeSegments : Expression -> ( Expression, List PipeSegment )
-extractPipeSegments expr =
-    case expr of
-        OperatorApplication "|>" _ leftNode rightNode ->
-            let
-                ( firstExpr, leftSegments ) =
-                    extractPipeSegments (Node.value leftNode)
-
-                rightExpr =
-                    Node.value rightNode
-            in
-            case rightExpr of
-                -- |> Maybe.andThen f or |> Maybe.map f
-                Application ((Node _ (FunctionOrValue moduleName funcName)) :: args) ->
-                    if (List.isEmpty moduleName || moduleName == [ "Maybe" ] || moduleName == [ "Maybe", "Extra" ]) && List.length args == 1 then
-                        let
-                            qualifiedName =
-                                if List.isEmpty moduleName then
-                                    funcName
-
-                                else
-                                    String.join "." moduleName ++ "." ++ funcName
-
-                            segment =
-                                { operator = qualifiedName
-                                , argument = Node.value (List.head args |> Maybe.withDefault (Node.empty UnitExpr))
-                                }
-                        in
-                        ( firstExpr, leftSegments ++ [ segment ] )
-
-                    else
-                        -- Not a Maybe operation, keep as single segment
-                        ( firstExpr, leftSegments ++ [ { operator = "COMPLEX", argument = rightExpr } ] )
-
-                _ ->
-                    -- Not a function application
-                    ( firstExpr, leftSegments ++ [ { operator = "COMPLEX", argument = rightExpr } ] )
-
-        _ ->
-            ( expr, [] )
-
-
-classifyJustBranch : Expression -> JustBranchType
-classifyJustBranch expr =
-    case expr of
-        -- Just x -> Maybe.map with identity (single variable)
-        FunctionOrValue [] _ ->
-            -- Could be identity or a function returning Maybe - treat as andThen to be safe
-            MaybeAndThenCase expr []
-
-        -- Just (something) or Just something -> Maybe.map
+classifyJustBranch : List String -> Node Expression -> JustBranch
+classifyJustBranch boundNames node =
+    case Node.value node of
+        -- Just something -> Maybe.map
         Application ((Node _ (FunctionOrValue moduleName "Just")) :: args) ->
-            if List.isEmpty moduleName || moduleName == [ "Maybe" ] then
+            if isMaybeModule moduleName then
                 case args of
-                    [ argNode ] ->
-                        MaybeMapCase (Node.value argNode)
+                    [ arg ] ->
+                        MapTo (unwrapParens arg)
 
                     _ ->
                         NotApplicable
 
             else
-                -- Not Just, it's a function call returning Maybe -> andThen
-                MaybeAndThenCase expr []
+                AndThenTo node []
 
-        -- Any other application (not starting with Just) -> andThen
+        -- A variable could be a Maybe -> andThen
+        FunctionOrValue [] _ ->
+            AndThenTo node []
+
+        -- A function call, a field or an if returning a Maybe -> andThen
         Application _ ->
-            MaybeAndThenCase expr []
+            AndThenTo node []
 
-        -- Record access like r.name without Just wrapper -> andThen
         RecordAccess _ _ ->
-            MaybeAndThenCase expr []
+            AndThenTo node []
 
-        -- If expression -> andThen (since it can return Nothing)
         IfBlock _ _ _ ->
-            MaybeAndThenCase expr []
+            AndThenTo node []
 
-        -- Let expression -> check what it returns, but keep full expression for formatting
         LetExpression letBlock ->
-            case classifyJustBranch (Node.value letBlock.expression) of
-                MaybeMapCase _ ->
-                    -- Let returns Just something -> still treat the whole let as andThen
-                    MaybeAndThenCase expr []
+            case classifyJustBranch boundNames letBlock.expression of
+                NotApplicable ->
+                    NotApplicable
 
-                MaybeAndThenCase _ _ ->
-                    MaybeAndThenCase expr []
+                _ ->
+                    AndThenTo node []
+
+        ParenthesizedExpression inner ->
+            case classifyJustBranch boundNames inner of
+                MapTo mapped ->
+                    MapTo mapped
+
+                AndThenTo _ _ ->
+                    AndThenTo node []
 
                 NotApplicable ->
                     NotApplicable
 
-        -- Parenthesized expression -> unwrap and check, but keep parens in output
-        ParenthesizedExpression innerNode ->
-            case classifyJustBranch (Node.value innerNode) of
-                MaybeMapCase innerExpr ->
-                    MaybeMapCase innerExpr
-
-                MaybeAndThenCase _ _ ->
-                    MaybeAndThenCase expr []
-
-                NotApplicable ->
-                    NotApplicable
-
-        -- Pipe expression -> extract and flatten the pipe chain
         OperatorApplication "|>" _ _ _ ->
             let
-                ( firstExpr, segments ) =
-                    extractPipeSegments expr
+                ( body, steps ) =
+                    splitPipeline boundNames node
             in
-            MaybeAndThenCase firstExpr segments
+            AndThenTo body steps
 
         _ ->
             NotApplicable
 
 
-nodeToString : Node Expression -> String
-nodeToString node =
-    expressionToString (Node.value node)
-
-
-{-| Check if an expression needs parentheses when used as an argument
+{-| Split `a |> s1 |> s2 |> s3` into the part that stays in the `Maybe.andThen` lambda and
+the trailing steps that can move out after it. A step can move out only if it gives Nothing
+for Nothing (`Maybe.map f` or `Maybe.andThen f`) and doesn't use a name the `Just` pattern binds.
 -}
-needsParens : Expression -> Bool
-needsParens expr =
-    case expr of
-        Application (_ :: _ :: _) ->
-            -- Multi-argument application needs parens
-            True
+splitPipeline : List String -> Node Expression -> ( Node Expression, List (Node Expression) )
+splitPipeline boundNames node =
+    case Node.value node of
+        OperatorApplication "|>" _ left right ->
+            if isMovableStep boundNames right then
+                let
+                    ( body, steps ) =
+                        splitPipeline boundNames left
+                in
+                ( body, steps ++ [ right ] )
+
+            else
+                ( node, [] )
+
+        _ ->
+            ( node, [] )
+
+
+isMovableStep : List String -> Node Expression -> Bool
+isMovableStep boundNames node =
+    case Node.value node of
+        Application [ Node _ (FunctionOrValue [ "Maybe" ] name), arg ] ->
+            (name == "map" || name == "andThen") && not (references boundNames arg)
+
+        _ ->
+            False
+
+
+{-| Does the expression make a tail call to one of the functions?
+-}
+makesTailCall : List String -> Node Expression -> Bool
+makesTailCall names node =
+    case Node.value node of
+        Application (function :: _) ->
+            isCallTo names function
+
+        OperatorApplication "<|" _ function _ ->
+            isCallTo names function
+
+        OperatorApplication "|>" _ _ function ->
+            isCallTo names function
+
+        ParenthesizedExpression inner ->
+            makesTailCall names inner
+
+        IfBlock _ thenBranch elseBranch ->
+            makesTailCall names thenBranch || makesTailCall names elseBranch
+
+        LetExpression letBlock ->
+            makesTailCall names letBlock.expression
+
+        CaseExpression caseBlock ->
+            List.any (Tuple.second >> makesTailCall names) caseBlock.cases
+
+        _ ->
+            False
+
+
+isCallTo : List String -> Node Expression -> Bool
+isCallTo names node =
+    case Node.value node of
+        FunctionOrValue [] name ->
+            List.member name names
+
+        Application (function :: _) ->
+            isCallTo names function
+
+        ParenthesizedExpression inner ->
+            isCallTo names inner
+
+        _ ->
+            False
+
+
+
+-- FIXING
+
+
+createError : Context -> Range -> MaybeCase -> List (Rule.Error {})
+createError context range maybeCase =
+    if isNothingExpression maybeCase.nothingExpr then
+        case classifyJustBranch (patternNames maybeCase.justPattern) maybeCase.justExpr of
+            MapTo body ->
+                [ report context
+                    range
+                    { message = "Use Maybe.map instead of case expression"
+                    , details = [ "This case expression can be simplified using Maybe.map with a pipe." ]
+                    }
+                    { subject = maybeCase.subject
+                    , kept = [ Node.range maybeCase.justPattern, Node.range body ]
+                    , steps = [ "Maybe.map " ++ lambda context maybeCase.justPattern body ]
+                    , extraFixes = []
+                    }
+                ]
+
+            AndThenTo body steps ->
+                [ report context
+                    range
+                    { message = "Use Maybe.andThen instead of case expression"
+                    , details = [ "This case expression can be simplified using Maybe.andThen with a pipe." ]
+                    }
+                    { subject = maybeCase.subject
+                    , kept = Node.range maybeCase.justPattern :: Node.range body :: List.map Node.range steps
+                    , steps =
+                        ("Maybe.andThen " ++ lambda context maybeCase.justPattern body)
+                            :: List.map (Node.range >> context.extractSourceCode) steps
+                    , extraFixes = []
+                    }
+                ]
+
+            NotApplicable ->
+                []
+
+    else if isBoundVariable maybeCase.justPattern maybeCase.justExpr then
+        withDefaultErrors context range maybeCase
+
+    else
+        []
+
+
+{-| `Nothing -> default; Just x -> x`
+-}
+withDefaultErrors : Context -> Range -> MaybeCase -> List (Rule.Error {})
+withDefaultErrors context range maybeCase =
+    let
+        default : Node Expression
+        default =
+            unwrapParens maybeCase.nothingExpr
+
+        defaultSource : String
+        defaultSource =
+            context.extractSourceCode (Node.range default)
+    in
+    if isSimpleDefault (Node.value default) then
+        [ report context
+            range
+            { message = "Use Maybe.withDefault instead of case expression"
+            , details = [ "This case expression can be simplified using Maybe.withDefault." ]
+            }
+            { subject = maybeCase.subject
+            , kept = [ Node.range default ]
+            , steps = [ "Maybe.withDefault " ++ defaultSource ]
+            , extraFixes = []
+            }
+        ]
+
+    else if not context.hasMaybeExtra then
+        [ Rule.error
+            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
+            , details =
+                [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy."
+                , "Add elm-community/maybe-extra to the project's dependencies to get an automatic fix."
+                ]
+            }
+            range
+        ]
+
+    else
+        [ report context
+            range
+            { message = "Use Maybe.Extra.withDefaultLazy instead of case expression"
+            , details = [ "This case expression can be simplified using Maybe.Extra.withDefaultLazy." ]
+            }
+            { subject = maybeCase.subject
+            , kept = [ Node.range default ]
+            , steps = [ Maybe.withDefault "Maybe.Extra" context.maybeExtraQualifier ++ ".withDefaultLazy (\\() -> " ++ defaultSource ++ ")" ]
+            , extraFixes =
+                case context.maybeExtraQualifier of
+                    Just _ ->
+                        []
+
+                    Nothing ->
+                        [ Fix.insertAt context.importLocation "\nimport Maybe.Extra" ]
+            }
+        ]
+
+
+type alias Rewrite =
+    { subject : Node Expression
+
+    -- The other parts of the case expression the rewrite copies over
+    , kept : List Range
+
+    -- What goes after each `|>`
+    , steps : List String
+    , extraFixes : List Fix
+    }
+
+
+{-| Report the case expression, with a fix that turns it into `subject |> step1 |> step2 ...`.
+
+If the case expression has a comment outside of the parts the fix copies over, the fix would
+drop it, so the error has no fix.
+
+-}
+report : Context -> Range -> { message : String, details : List String } -> Rewrite -> Rule.Error {}
+report context range error rewrite =
+    let
+        kept : List Range
+        kept =
+            Node.range rewrite.subject :: rewrite.kept
+
+        dropsComment : Bool
+        dropsComment =
+            List.any
+                (\comment -> isWithin range comment && not (List.any (\keptRange -> isWithin keptRange comment) kept))
+                context.comments
+    in
+    if dropsComment then
+        Rule.error error range
+
+    else
+        Rule.errorWithFix error range (Fix.replaceRangeBy range (pipeline context range rewrite) :: rewrite.extraFixes)
+
+
+pipeline : Context -> Range -> Rewrite -> String
+pipeline context range rewrite =
+    let
+        -- The pipe is indented one level further than the case expression
+        pipeIndent : String
+        pipeIndent =
+            String.repeat (range.start.column - 1 + 4) " "
+
+        source : String
+        source =
+            subjectToString context rewrite.subject
+                ++ String.concat (List.map (\step -> "\n" ++ pipeIndent ++ "|> " ++ step) rewrite.steps)
+    in
+    if List.member range context.operatorOperands then
+        -- `f <| case ...` or `x ++ case ...`: the pipeline would otherwise take the operator's
+        -- left side as its subject (or not compile, for `<|`)
+        "(" ++ source ++ ")"
+
+    else
+        source
+
+
+subjectToString : Context -> Node Expression -> String
+subjectToString context subject =
+    let
+        unwrapped : Node Expression
+        unwrapped =
+            unwrapParens subject
+
+        source : String
+        source =
+            context.extractSourceCode (Node.range unwrapped)
+    in
+    case Node.value unwrapped of
+        -- These would swallow the `|>` or (for `<|`) not compile next to it
+        OperatorApplication "<|" _ _ _ ->
+            "(" ++ source ++ ")"
 
         IfBlock _ _ _ ->
+            "(" ++ source ++ ")"
+
+        LetExpression _ ->
+            "(" ++ source ++ ")"
+
+        CaseExpression _ ->
+            "(" ++ source ++ ")"
+
+        LambdaExpression _ ->
+            "(" ++ source ++ ")"
+
+        _ ->
+            source
+
+
+lambda : Context -> Node Pattern -> Node Expression -> String
+lambda context pattern body =
+    "(\\" ++ context.extractSourceCode (Node.range pattern) ++ " -> " ++ context.extractSourceCode (Node.range body) ++ ")"
+
+
+{-| Whether the default is cheap enough to evaluate eagerly with `Maybe.withDefault`
+-}
+isSimpleDefault : Expression -> Bool
+isSimpleDefault expr =
+    case expr of
+        FunctionOrValue _ _ ->
             True
 
-        OperatorApplication _ _ _ _ ->
+        Integer _ ->
+            True
+
+        Hex _ ->
+            True
+
+        Negation inner ->
+            case Node.value inner of
+                Integer _ ->
+                    True
+
+                Hex _ ->
+                    True
+
+                Floatable _ ->
+                    True
+
+                _ ->
+                    False
+
+        Floatable _ ->
+            True
+
+        Literal _ ->
+            True
+
+        CharLiteral _ ->
+            True
+
+        ListExpr [] ->
+            True
+
+        UnitExpr ->
             True
 
         _ ->
             False
 
 
-expressionToString : Expression -> String
-expressionToString =
-    expressionToStringWithIndent ""
+
+-- HELPERS
 
 
-expressionToStringAsArgWithBaseIndent : String -> Expression -> String
-expressionToStringAsArgWithBaseIndent baseIndent expr =
-    case expr of
-        -- Parenthesized expressions - keep the parens since they were in source
-        ParenthesizedExpression innerNode ->
-            "(" ++ expressionToStringWithIndent baseIndent (Node.value innerNode) ++ ")"
+unwrapParens : Node Expression -> Node Expression
+unwrapParens node =
+    case Node.value node of
+        ParenthesizedExpression inner ->
+            unwrapParens inner
 
         _ ->
-            if needsParens expr then
-                "(" ++ expressionToStringWithIndent baseIndent expr ++ ")"
-
-            else
-                expressionToStringWithIndent baseIndent expr
+            node
 
 
-{-| Convert expression to string with proper indentation for pipe expressions.
-The baseIndent is the indentation to use for continuation lines (pipes).
+isWithin : Range -> Range -> Bool
+isWithin outer inner =
+    ( outer.start.row, outer.start.column )
+        <= ( inner.start.row, inner.start.column )
+        && ( inner.end.row, inner.end.column )
+        <= ( outer.end.row, outer.end.column )
+
+
+patternNames : Node Pattern -> List String
+patternNames node =
+    case Node.value node of
+        Pattern.VarPattern name ->
+            [ name ]
+
+        Pattern.AsPattern inner (Node _ name) ->
+            name :: patternNames inner
+
+        Pattern.ParenthesizedPattern inner ->
+            patternNames inner
+
+        Pattern.TuplePattern patterns ->
+            List.concatMap patternNames patterns
+
+        Pattern.ListPattern patterns ->
+            List.concatMap patternNames patterns
+
+        Pattern.NamedPattern _ patterns ->
+            List.concatMap patternNames patterns
+
+        Pattern.UnConsPattern head tail ->
+            patternNames head ++ patternNames tail
+
+        Pattern.RecordPattern fields ->
+            List.map Node.value fields
+
+        _ ->
+            []
+
+
+{-| Does the expression refer to any of the (unqualified) names?
 -}
-expressionToStringWithIndent : String -> Expression -> String
-expressionToStringWithIndent baseIndent expr =
-    let
-        nextIndent =
-            baseIndent ++ "    "
-    in
-    case expr of
+references : List String -> Node Expression -> Bool
+references names node =
+    case Node.value node of
         FunctionOrValue [] name ->
-            name
+            List.member name names
 
-        FunctionOrValue moduleName name ->
-            String.join "." moduleName ++ "." ++ name
+        RecordUpdateExpression (Node _ name) fields ->
+            List.member name names || List.any (Node.value >> Tuple.second >> references names) fields
 
+        expr ->
+            List.any (references names) (subExpressions expr)
+
+
+subExpressions : Expression -> List (Node Expression)
+subExpressions expr =
+    case expr of
         Application nodes ->
-            case nodes of
-                [] ->
-                    ""
+            nodes
 
-                [ single ] ->
-                    nodeToStringWithIndent baseIndent single
+        OperatorApplication _ _ left right ->
+            [ left, right ]
 
-                funcNode :: argNodes ->
-                    -- First element is the function, rest are arguments
-                    nodeToStringWithIndent baseIndent funcNode ++ " " ++ String.join " " (List.map (nodeToStringAsArgWithIndent baseIndent) argNodes)
+        IfBlock condition thenBranch elseBranch ->
+            [ condition, thenBranch, elseBranch ]
 
-        RecordAccess recordNode (Node _ fieldName) ->
-            nodeToStringWithIndent baseIndent recordNode ++ "." ++ fieldName
+        Negation inner ->
+            [ inner ]
 
-        RecordAccessFunction fieldName ->
-            -- fieldName already includes the dot
-            fieldName
+        TupledExpression nodes ->
+            nodes
 
-        ParenthesizedExpression innerNode ->
-            -- Don't add extra parens, just return the inner content
-            nodeToStringWithIndent baseIndent innerNode
-
-        IfBlock condNode thenNode elseNode ->
-            "if " ++ nodeToStringWithIndent baseIndent condNode ++ " then " ++ nodeToStringWithIndent baseIndent thenNode ++ " else " ++ nodeToStringWithIndent baseIndent elseNode
-
-        OperatorApplication "|>" _ leftNode rightNode ->
-            -- Format pipe with newline
-            nodeToStringWithIndent baseIndent leftNode ++ "\n" ++ nextIndent ++ "|> " ++ nodeToStringWithIndent nextIndent rightNode
-
-        OperatorApplication op _ leftNode rightNode ->
-            nodeToStringWithIndent baseIndent leftNode ++ " " ++ op ++ " " ++ nodeToStringWithIndent baseIndent rightNode
-
-        Integer n ->
-            String.fromInt n
-
-        Floatable n ->
-            String.fromFloat n
-
-        Literal s ->
-            "\"" ++ s ++ "\""
-
-        ListExpr items ->
-            "[" ++ String.join ", " (List.map (nodeToStringWithIndent baseIndent) items) ++ "]"
-
-        TupledExpression items ->
-            "( " ++ String.join ", " (List.map (nodeToStringWithIndent baseIndent) items) ++ " )"
-
-        LambdaExpression lambda ->
-            let
-                argsStr =
-                    List.filterMap (Node.value >> patternToString) lambda.args
-                        |> String.join " "
-
-                bodyStr =
-                    nodeToStringWithIndent nextIndent lambda.expression
-            in
-            -- Check if body contains pipes/let and format accordingly
-            if String.contains "\n" bodyStr then
-                "(\\" ++ argsStr ++ " ->\n" ++ nextIndent ++ bodyStr ++ "\n" ++ baseIndent ++ ")"
-
-            else
-                "(\\" ++ argsStr ++ " -> " ++ bodyStr ++ ")"
+        ParenthesizedExpression inner ->
+            [ inner ]
 
         LetExpression letBlock ->
-            let
-                declarationsStr =
-                    List.map (letDeclarationToStringWithIndent nextIndent) letBlock.declarations
-                        |> String.join ("\n" ++ nextIndent)
-
-                bodyStr =
-                    nodeToStringWithIndent baseIndent letBlock.expression
-            in
-            "let\n" ++ nextIndent ++ declarationsStr ++ "\n" ++ baseIndent ++ "in\n" ++ baseIndent ++ bodyStr
+            letBlock.expression :: List.map letDeclarationExpression letBlock.declarations
 
         CaseExpression caseBlock ->
-            let
-                casesStr =
-                    List.map (caseToStringWithIndent baseIndent) caseBlock.cases
-                        |> String.join " ; "
-            in
-            "case " ++ nodeToStringWithIndent baseIndent caseBlock.expression ++ " of " ++ casesStr
+            caseBlock.expression :: List.map Tuple.second caseBlock.cases
 
-        Negation innerNode ->
-            "-" ++ nodeToStringWithIndent baseIndent innerNode
-
-        CharLiteral c ->
-            "'" ++ String.fromChar c ++ "'"
+        LambdaExpression lambda_ ->
+            [ lambda_.expression ]
 
         RecordExpr fields ->
-            let
-                fieldStr ( Node _ fieldName, valueNode ) =
-                    fieldName ++ " = " ++ nodeToStringWithIndent baseIndent valueNode
-            in
-            "{ " ++ String.join ", " (List.map (Node.value >> fieldStr) fields) ++ " }"
+            List.map (Node.value >> Tuple.second) fields
 
-        RecordUpdateExpression (Node _ recordName) fields ->
-            let
-                fieldStr ( Node _ fieldName, valueNode ) =
-                    fieldName ++ " = " ++ nodeToStringWithIndent baseIndent valueNode
-            in
-            "{ " ++ recordName ++ " | " ++ String.join ", " (List.map (Node.value >> fieldStr) fields) ++ " }"
+        ListExpr nodes ->
+            nodes
 
-        UnitExpr ->
-            "()"
+        RecordAccess record _ ->
+            [ record ]
 
         _ ->
-            "<expr>"
+            []
 
 
-nodeToStringWithIndent : String -> Node Expression -> String
-nodeToStringWithIndent baseIndent node =
-    expressionToStringWithIndent baseIndent (Node.value node)
-
-
-nodeToStringAsArgWithIndent : String -> Node Expression -> String
-nodeToStringAsArgWithIndent baseIndent node =
-    let
-        expr =
-            Node.value node
-    in
-    case expr of
-        -- Parenthesized expressions - keep the parens since they were in source
-        ParenthesizedExpression innerNode ->
-            "(" ++ expressionToStringWithIndent baseIndent (Node.value innerNode) ++ ")"
-
-        _ ->
-            if needsParens expr then
-                "(" ++ expressionToStringWithIndent baseIndent expr ++ ")"
-
-            else
-                expressionToStringWithIndent baseIndent expr
-
-
-letDeclarationToStringWithIndent : String -> Node Expression.LetDeclaration -> String
-letDeclarationToStringWithIndent baseIndent node =
-    let
-        nextIndent =
-            baseIndent ++ "    "
-    in
+letDeclarationExpression : Node Expression.LetDeclaration -> Node Expression
+letDeclarationExpression node =
     case Node.value node of
-        Expression.LetFunction func ->
-            let
-                declaration =
-                    Node.value func.declaration
+        Expression.LetFunction function ->
+            (Node.value function.declaration).expression
 
-                name =
-                    Node.value declaration.name
-
-                argsStr =
-                    List.filterMap (Node.value >> patternToString) declaration.arguments
-                        |> String.join " "
-
-                argsWithSpace =
-                    if String.isEmpty argsStr then
-                        ""
-
-                    else
-                        " " ++ argsStr
-
-                valueStr =
-                    nodeToStringWithIndent nextIndent declaration.expression
-            in
-            if String.contains "\n" valueStr then
-                name ++ argsWithSpace ++ " =\n" ++ nextIndent ++ valueStr
-
-            else
-                name ++ argsWithSpace ++ " = " ++ valueStr
-
-        Expression.LetDestructuring pattern expr ->
-            case patternToString (Node.value pattern) of
-                Just patStr ->
-                    let
-                        valueStr =
-                            nodeToStringWithIndent nextIndent expr
-                    in
-                    if String.contains "\n" valueStr then
-                        patStr ++ " =\n" ++ nextIndent ++ valueStr
-
-                    else
-                        patStr ++ " = " ++ valueStr
-
-                Nothing ->
-                    "<decl>"
-
-
-caseToStringWithIndent : String -> Expression.Case -> String
-caseToStringWithIndent baseIndent ( patternNode, exprNode ) =
-    case patternToString (Node.value patternNode) of
-        Just patStr ->
-            patStr ++ " -> " ++ nodeToStringWithIndent baseIndent exprNode
-
-        Nothing ->
-            "<case>"
+        Expression.LetDestructuring _ expr ->
+            expr

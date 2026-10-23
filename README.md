@@ -29,7 +29,7 @@ config =
 
 ### PreferMaybeChaining
 
-**Note:** This rule suggests using [`Maybe.Extra.withDefaultLazy`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) for complex default expressions. Make sure [`elm-community/maybe-extra`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) is installed in your project.
+**Note:** This rule suggests using [`Maybe.Extra.withDefaultLazy`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) for complex default expressions. Make sure [`elm-community/maybe-extra`](https://package.elm-lang.org/packages/elm-community/maybe-extra/latest/) is installed in your project. The fix adds `import Maybe.Extra` when the module doesn't import it yet, and uses the alias when it is imported with one. Without the package in the project's direct dependencies, the rule reports the case without a fix.
 
 #### Maybe.map
 
@@ -57,7 +57,7 @@ maybeId
     |> Maybe.andThen (\id -> Store.findById id store)
 ```
 
-Pipe chains are flattened:
+Trailing `Maybe.map` / `Maybe.andThen` steps are moved out of the lambda, as long as they don't use the variable the `Just` pattern binds:
 
 ```elm
 -- Before
