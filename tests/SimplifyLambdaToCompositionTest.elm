@@ -10,6 +10,7 @@ all =
     describe "SimplifyLambdaToComposition"
         [ shouldSimplifyTests
         , shouldNotSimplifyTests
+        , edgeCaseTests
         ]
 
 
@@ -144,4 +145,104 @@ a = List.map (\\(x, y) -> func x.field) items
 """
                     |> Review.Test.run rule
                     |> Review.Test.expectNoErrors
+        ]
+
+
+compositionError : { original : String, replacement : String, under : String } -> Review.Test.ExpectedError
+compositionError { original, replacement, under } =
+    Review.Test.error
+        { message = "Lambda can be simplified to function composition"
+        , details = [ "Instead of `(" ++ original ++ ")`, you can write `(" ++ replacement ++ ")`." ]
+        , under = under
+        }
+
+
+edgeCaseTests : Test
+edgeCaseTests =
+    describe "edge cases"
+        [ test "lambda as a whole declaration body" <|
+            \() ->
+                """module A exposing (..)
+a = \\x -> f x.name
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectErrors
+                        [ compositionError { original = "\\x -> f x.name", replacement = "f << .name", under = "\\x -> f x.name" }
+                            |> Review.Test.whenFixed """module A exposing (..)
+a = f << .name
+"""
+                        ]
+        , test "lambda after <| needs no parentheses" <|
+            \() ->
+                """module A exposing (..)
+a = List.map <| \\x -> f x.name
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectErrors
+                        [ compositionError { original = "\\x -> f x.name", replacement = "f << .name", under = "\\x -> f x.name" }
+                            |> Review.Test.whenFixed """module A exposing (..)
+a = List.map <| f << .name
+"""
+                        ]
+        , test "lambda as the right operand of >> gets parentheses" <|
+            \() ->
+                """module A exposing (..)
+a = g >> \\x -> f x.name
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectErrors
+                        [ compositionError { original = "\\x -> f x.name", replacement = "f << .name", under = "\\x -> f x.name" }
+                            |> Review.Test.whenFixed """module A exposing (..)
+a = g >> (f << .name)
+"""
+                        ]
+        , test "function with the same name as the parameter" <|
+            \() ->
+                """module A exposing (..)
+a = List.map (\\f -> f f.field) items
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectNoErrors
+        , test "nested function with the same name as the parameter" <|
+            \() ->
+                """module A exposing (..)
+a = List.map (\\x -> g (x x.field)) items
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectNoErrors
+        , test "a comment the fix would drop: report without a fix" <|
+            \() ->
+                """module A exposing (..)
+a = List.map (\\x -> f {- why -} x.name) items
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectErrors
+                        [ compositionError { original = "\\x -> f x.name", replacement = "f << .name", under = "\\x -> f {- why -} x.name" }
+                        ]
+        , test "multi-line lambda" <|
+            \() ->
+                """module A exposing (..)
+a =
+    List.map
+        (\\x ->
+            f
+                (g x.name)
+        )
+        items
+"""
+                    |> Review.Test.run rule
+                    |> Review.Test.expectErrors
+                        [ compositionError
+                            { original = "\\x -> f (g x.name)"
+                            , replacement = "f << g << .name"
+                            , under = "\\x ->\n            f\n                (g x.name)"
+                            }
+                            |> Review.Test.whenFixed """module A exposing (..)
+a =
+    List.map
+        (f << g << .name
+        )
+        items
+"""
+                        ]
         ]
